@@ -70,6 +70,12 @@ router.get('/assignments', async (req, res) => {
 router.post('/assignments', async (req, res) => {
   const { reporter_id, title, location, start_date, end_date, priority, description, status } = req.body;
   
+  if (start_date && end_date) {
+    const todayStr = new Date().toLocaleDateString('en-CA');
+    if (start_date < todayStr) return res.status(400).json({ error: 'Start date cannot be in the past.' });
+    if (end_date < start_date) return res.status(400).json({ error: 'End date must be after or equal to the start date.' });
+  }
+
   try {
     const { rows } = await pool.query(
       `INSERT INTO assignments (reporter_id, title, location, start_date, end_date, priority, description, status) 
@@ -91,6 +97,10 @@ router.put('/assignments/:id', async (req, res) => {
   const { id } = req.params;
   const { reporter_id, title, location, start_date, end_date, priority, description, status } = req.body;
   
+  if (start_date && end_date) {
+    if (end_date < start_date) return res.status(400).json({ error: 'End date must be after or equal to the start date.' });
+  }
+
   try {
     const oldRes = await pool.query('SELECT status FROM assignments WHERE id = $1', [id]);
     if (oldRes.rows.length === 0) return res.status(404).json({ error: 'Not found' });
