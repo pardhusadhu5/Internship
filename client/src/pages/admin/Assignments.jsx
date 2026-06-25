@@ -15,6 +15,7 @@ export default function AdminAssignments() {
   const [modal, setModal] = useState(false);
   const [form, setForm] = useState(empty);
   const [editId, setEditId] = useState(null);
+  const [error, setError] = useState('');
 
   const load = (page = 1) => {
     api.admin.assignments({ search, status, page, limit: 10 }).then(setData);
@@ -23,18 +24,52 @@ export default function AdminAssignments() {
   useEffect(() => { load(); api.admin.reportersAll().then(setReporters); }, []);
   useEffect(() => { load(1); }, [search, status]);
 
-  const openCreate = () => { setForm(empty); setEditId(null); setModal(true); };
+  const openCreate = () => { setForm(empty); setEditId(null); setError(''); setModal(true); };
   const openEdit = (row) => {
-    setForm({ reporter_id: row.reporter_id, title: row.title, location: row.location, start_date: row.start_date, end_date: row.end_date, priority: row.priority, description: row.description || '', status: row.status });
+    setForm({ reporter_id: row.reporter_id, title: row.title, location: row.location, start_date: row.start_date || '', end_date: row.end_date || '', priority: row.priority, description: row.description || '', status: row.status });
     setEditId(row.id);
+    setError('');
     setModal(true);
   };
 
+  const todayStr = new Date().toLocaleDateString('en-CA'); // Gets YYYY-MM-DD in local timezone
+
+  const handleStartDateChange = (e) => {
+    const newStart = e.target.value;
+    setForm(prev => {
+      const next = { ...prev, start_date: newStart };
+      if (prev.end_date && newStart > prev.end_date) {
+        next.end_date = '';
+      }
+      return next;
+    });
+  };
+
   const handleSave = async () => {
-    if (editId) await api.admin.updateAssignment(editId, form);
-    else await api.admin.createAssignment(form);
-    setModal(false);
-    load(data.page);
+    setError('');
+    if (!form.reporter_id || !form.title || !form.start_date || !form.end_date) {
+      setError('Please fill all required fields.');
+      return;
+    }
+    
+    // Date validations
+    if (form.start_date < todayStr) {
+      setError('Start date cannot be in the past.');
+      return;
+    }
+    if (form.end_date < form.start_date) {
+      setError('End date must be after or equal to the start date.');
+      return;
+    }
+
+    try {
+      if (editId) await api.admin.updateAssignment(editId, form);
+      else await api.admin.createAssignment(form);
+      setModal(false);
+      load(data.page);
+    } catch (err) {
+      setError(err.message || 'Error saving assignment');
+    }
   };
 
   const handleDelete = async (id) => {
@@ -89,6 +124,7 @@ export default function AdminAssignments() {
 
       <Modal open={modal} onClose={() => setModal(false)} title={editId ? 'Edit Assignment' : 'Create Assignment'}
         footer={<><button className="btn btn-secondary" onClick={() => setModal(false)}>Cancel</button><button className="btn btn-primary" onClick={handleSave}>Save</button></>}>
+        {error && <div className="alert alert-danger" style={{ marginBottom: '1rem', color: '#dc3545', background: '#f8d7da', padding: '10px', borderRadius: '4px' }}>{error}</div>}
         <div className="form-row">
           <div className="form-group">
             <label>Reporter</label>
@@ -115,11 +151,24 @@ export default function AdminAssignments() {
         <div className="form-row">
           <div className="form-group">
             <label>Start Date</label>
-            <input className="form-input" type="date" value={form.start_date} onChange={e => setForm({ ...form, start_date: e.target.value })} />
+            <input 
+              className="form-input" 
+              type="date" 
+              min={todayStr} 
+              value={form.start_date ? form.start_date.split('T')[0] : ''} 
+              onChange={handleStartDateChange} 
+            />
           </div>
           <div className="form-group">
             <label>End Date</label>
-            <input className="form-input" type="date" value={form.end_date} onChange={e => setForm({ ...form, end_date: e.target.value })} />
+            <input 
+              className="form-input" 
+              type="date" 
+              min={form.start_date ? form.start_date.split('T')[0] : todayStr} 
+              disabled={!form.start_date}
+              value={form.end_date ? form.end_date.split('T')[0] : ''} 
+              onChange={e => setForm({ ...form, end_date: e.target.value })} 
+            />
           </div>
         </div>
         {editId && (
