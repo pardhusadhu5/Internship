@@ -1,262 +1,495 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
-const { db, logAudit, notify, recalculateSettlement, data } = require('../db');
+const { pool, logAudit, notify, recalculateSettlement } = require('../dbConfig');
 const { authMiddleware, requireRole } = require('../middleware/auth');
 
 const router = express.Router();
 router.use(authMiddleware, requireRole('admin'));
 
-function paginate(items, page, limit) {
+router.get('/dashboard', async (req, res) => {
+  try {
+    const [reportersRes, activeAssignmentsRes, advancesRes, pendingExpensesRes, settlementsRes, totalExpensesRes] = await Promise.all([
+      pool.query("SELECT COUNT(*) FROM users WHERE role = 'reporter' AND active = 1"),
+      pool.query("SELECT COUNT(*) FROM assignments WHERE status IN ('Assigned', 'In Progress')"),
+      pool.query("SELECT COALESCE(SUM(amount), 0) as total FROM advance_requests WHERE status = 'Approved'"),
+      pool.query("SELECT COUNT(*) FROM expenses WHERE status = 'Pending'"),
+      pool.query("SELECT COUNT(*) FROM settlements WHERE settlement_status != 'Settled'"),
+      pool.query("SELECT COALESCE(SUM(amount), 0) as total FROM expenses WHERE status = 'Approved'")
+    ]);
+
+    res.json({
+      totalReporters: parseInt(reportersRes.rows[0].count),
+      activeAssignments: parseInt(activeAssignmentsRes.rows[0].count),
+      advancesIssued: parseFloat(advancesRes.rows[0].total),
+      pendingExpenses: parseInt(pendingExpensesRes.rows[0].count),
+      settlementsPending: parseInt(settlementsRes.rows[0].count),
+      totalExpenseAmount: parseFloat(totalExpensesRes.rows[0].total)
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+router.get('/assignments', async (req, res) => {
+  const { search, status, page = 1, limit = 10 } = req.query;
   const p = Number(page);
   const l = Number(limit);
-  const start = (p - 1) * l;
-  return { data: items.slice(start, start + l), total: items.length, page: p, limit: l };
-}
-
-function getUserName(id) {
-  return db.users.find(u => u.id === id)?.name || 'Unknown';
-}
-
-router.get('/dashboard', (req, res) => {
-  res.json({
-    totalReporters: db.users.filter(u => u.role === 'reporter' && u.active === 1).length,
-    activeAssignments: db.assignments.filter(a => ['Assigned', 'In Progress'].includes(a.status)).length,
-    advancesIssued: db.advance_requests.filter(a => a.status === 'Approved').reduce((s, a) => s + a.amount, 0),
-    pendingExpenses: db.expenses.filter(e => e.status === 'Pending').length,
-    settlementsPending: db.settlements.filter(s => s.settlement_status !== 'Settled').length,
-    totalExpenseAmount: db.expenses.filter(e => e.status === 'Approved').reduce((s, e) => s + e.amount, 0),
-  });
-});
-
-router.get('/assignments', (req, res) => {
-  const { search, status, page = 1, limit = 10 } = req.query;
-  let items = db.assignments.map(a => ({ ...a, reporter_name: getUserName(a.reporter_id) }));
+  const offset = (p - 1) * l;
+  
+  let query = `
+    SELECT a.*, u.name as reporter_name 
+    FROM assignments a
+    LEFT JOIN users u ON a.reporter_id = u.id
+    WHERE 1=1
+  `;
+  const params = [];
+  
   if (search) {
-    const s = search.toLowerCase();
-    items = items.filter(a => a.title.toLowerCase().includes(s) || a.location.toLowerCase().includes(s) || a.reporter_name.toLowerCase().includes(s));
+    params.push(`%${search}%`);
+    query += ` AND (a.title ILIKE $${params.length} OR a.location ILIKE $${params.length} OR u.name ILIKE $${params.length})`;
   }
-  if (status) items = items.filter(a => a.status === status);
-  items.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-  res.json(paginate(items, page, limit));
+  if (status) {
+    params.push(status);
+    query += ` AND a.status = $${params.length}`;
+  }
+  
+  try {
+    const countRes = await pool.query(`SELECT COUNT(*) FROM (${query}) as t`, params);
+    query += ` ORDER BY a.created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+    params.push(l, offset);
+    
+    const { rows } = await pool.query(query, params);
+    res.json({ data: rows, total: parseInt(countRes.rows[0].count), page: p, limit: l });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
-router.post('/assignments', (req, res) => {
+router.post('/assignments', async (req, res) => {
   const { reporter_id, title, location, start_date, end_date, priority, description, status } = req.body;
-  const id = db.nextId('assignments');
-  db.assignments.push({ id, reporter_id, title, location, start_date, end_date, priority: priority || 'Medium', description, status: status || 'Assigned', created_at: db.now() });
-  db.save();
-  logAudit(req.user.id, `Admin created Assignment #${id}`, null, title);
-  notify(reporter_id, 'New Assignment', `You have been assigned: ${title}`);
-  res.json({ id, message: 'Assignment created' });
-});
-
-router.put('/assignments/:id', (req, res) => {
-  const old = db.assignments.find(a => a.id === Number(req.params.id));
-  if (!old) return res.status(404).json({ error: 'Not found' });
-  Object.assign(old, req.body);
-  db.save();
-  logAudit(req.user.id, `Admin updated Assignment #${req.params.id}`, old.status, req.body.status);
-  res.json({ message: 'Assignment updated' });
-});
-
-router.delete('/assignments/:id', (req, res) => {
-  const idx = db.assignments.findIndex(a => a.id === Number(req.params.id));
-  if (idx === -1) return res.status(404).json({ error: 'Not found' });
-  db.assignments.splice(idx, 1);
-  db.save();
-  logAudit(req.user.id, `Admin deleted Assignment #${req.params.id}`);
-  res.json({ message: 'Assignment deleted' });
-});
-
-router.get('/reporters', (req, res) => {
-  const { search, page = 1, limit = 10 } = req.query;
-  let items = db.users.filter(u => u.role === 'reporter').map(({ password, ...u }) => u);
-  if (search) {
-    const s = search.toLowerCase();
-    items = items.filter(u => u.name.toLowerCase().includes(s) || u.email.toLowerCase().includes(s));
+  
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO assignments (reporter_id, title, location, start_date, end_date, priority, description, status) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+      [reporter_id, title, location, start_date, end_date, priority || 'Medium', description, status || 'Assigned']
+    );
+    const id = rows[0].id;
+    
+    await logAudit(req.user.id, `Admin created Assignment #${id}`, null, title);
+    await notify(reporter_id, 'New Assignment', `You have been assigned: ${title}`);
+    res.json({ id, message: 'Assignment created' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
   }
-  res.json(paginate(items, page, limit));
 });
 
-router.get('/reporters/all', (req, res) => {
-  res.json(db.users.filter(u => u.role === 'reporter' && u.active === 1).map(({ id, name, email }) => ({ id, name, email })));
+router.put('/assignments/:id', async (req, res) => {
+  const { id } = req.params;
+  const { reporter_id, title, location, start_date, end_date, priority, description, status } = req.body;
+  
+  try {
+    const oldRes = await pool.query('SELECT status FROM assignments WHERE id = $1', [id]);
+    if (oldRes.rows.length === 0) return res.status(404).json({ error: 'Not found' });
+    
+    await pool.query(
+      `UPDATE assignments SET reporter_id = $1, title = $2, location = $3, start_date = $4, end_date = $5, priority = $6, description = $7, status = $8 WHERE id = $9`,
+      [reporter_id, title, location, start_date, end_date, priority, description, status, id]
+    );
+    
+    await logAudit(req.user.id, `Admin updated Assignment #${id}`, oldRes.rows[0].status, status);
+    res.json({ message: 'Assignment updated' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
-router.post('/reporters', (req, res) => {
+router.delete('/assignments/:id', async (req, res) => {
+  try {
+    const { rowCount } = await pool.query('DELETE FROM assignments WHERE id = $1', [req.params.id]);
+    if (rowCount === 0) return res.status(404).json({ error: 'Not found' });
+    
+    await logAudit(req.user.id, `Admin deleted Assignment #${req.params.id}`);
+    res.json({ message: 'Assignment deleted' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+router.get('/reporters', async (req, res) => {
+  const { search, page = 1, limit = 10 } = req.query;
+  const p = Number(page);
+  const l = Number(limit);
+  const offset = (p - 1) * l;
+  
+  let query = `SELECT id, name, email, active, created_at FROM users WHERE role = 'reporter'`;
+  const params = [];
+  
+  if (search) {
+    params.push(`%${search}%`);
+    query += ` AND (name ILIKE $${params.length} OR email ILIKE $${params.length})`;
+  }
+  
+  try {
+    const countRes = await pool.query(`SELECT COUNT(*) FROM (${query}) as t`, params);
+    query += ` ORDER BY created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+    params.push(l, offset);
+    
+    const { rows } = await pool.query(query, params);
+    res.json({ data: rows, total: parseInt(countRes.rows[0].count), page: p, limit: l });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+router.get('/reporters/all', async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT id, name, email FROM users WHERE role = 'reporter' AND active = 1");
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+router.post('/reporters', async (req, res) => {
   const { name, email, password } = req.body;
   if (!name || !email || !password) return res.status(400).json({ error: 'All fields required' });
-  if (db.users.find(u => u.email === email)) return res.status(400).json({ error: 'Email already exists' });
-  const id = db.nextId('users');
-  db.users.push({ id, name, email, password: bcrypt.hashSync(password, 10), role: 'reporter', active: 1, created_at: db.now() });
-  db.save();
-  logAudit(req.user.id, `Admin added Reporter ${name}`, null, email);
-  res.json({ id, message: 'Reporter added' });
+  
+  try {
+    const checkRes = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+    if (checkRes.rows.length > 0) return res.status(400).json({ error: 'Email already exists' });
+    
+    const hash = bcrypt.hashSync(password, 10);
+    const { rows } = await pool.query(
+      `INSERT INTO users (name, email, password, role, active) VALUES ($1, $2, $3, 'reporter', 1) RETURNING id`,
+      [name, email, hash]
+    );
+    
+    await logAudit(req.user.id, `Admin added Reporter ${name}`, null, email);
+    res.json({ id: rows[0].id, message: 'Reporter added' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
-router.put('/reporters/:id', (req, res) => {
-  const user = db.users.find(u => u.id === Number(req.params.id) && u.role === 'reporter');
-  if (!user) return res.status(404).json({ error: 'Not found' });
+router.put('/reporters/:id', async (req, res) => {
   const { name, email, active } = req.body;
-  user.name = name; user.email = email; user.active = active ? 1 : 0;
-  db.save();
-  logAudit(req.user.id, `Admin updated Reporter #${req.params.id}`);
-  res.json({ message: 'Reporter updated' });
+  try {
+    const { rowCount } = await pool.query(
+      "UPDATE users SET name = $1, email = $2, active = $3 WHERE id = $4 AND role = 'reporter'",
+      [name, email, active ? 1 : 0, req.params.id]
+    );
+    if (rowCount === 0) return res.status(404).json({ error: 'Not found' });
+    
+    await logAudit(req.user.id, `Admin updated Reporter #${req.params.id}`);
+    res.json({ message: 'Reporter updated' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
-router.post('/reporters/:id/reset-password', (req, res) => {
-  const user = db.users.find(u => u.id === Number(req.params.id));
-  if (!user) return res.status(404).json({ error: 'Not found' });
-  user.password = bcrypt.hashSync(req.body.password || 'reporter123', 10);
-  db.save();
-  logAudit(req.user.id, `Admin reset password for Reporter #${req.params.id}`);
-  res.json({ message: 'Password reset' });
+router.post('/reporters/:id/reset-password', async (req, res) => {
+  try {
+    const hash = bcrypt.hashSync(req.body.password || 'reporter123', 10);
+    const { rowCount } = await pool.query('UPDATE users SET password = $1 WHERE id = $2', [hash, req.params.id]);
+    if (rowCount === 0) return res.status(404).json({ error: 'Not found' });
+    
+    await logAudit(req.user.id, `Admin reset password for Reporter #${req.params.id}`);
+    res.json({ message: 'Password reset' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
-router.get('/advances', (req, res) => {
+router.get('/advances', async (req, res) => {
   const { search, status, page = 1, limit = 10 } = req.query;
-  let items = db.advance_requests.map(ar => ({
-    ...ar,
-    reporter_name: getUserName(ar.reporter_id),
-    assignment_title: db.assignments.find(a => a.id === ar.assignment_id)?.title || '—',
-  }));
+  const p = Number(page);
+  const l = Number(limit);
+  const offset = (p - 1) * l;
+  
+  let query = `
+    SELECT ar.*, u.name as reporter_name, a.title as assignment_title
+    FROM advance_requests ar
+    LEFT JOIN users u ON ar.reporter_id = u.id
+    LEFT JOIN assignments a ON ar.assignment_id = a.id
+    WHERE 1=1
+  `;
+  const params = [];
+  
   if (search) {
-    const s = search.toLowerCase();
-    items = items.filter(a => a.reporter_name.toLowerCase().includes(s) || a.assignment_title.toLowerCase().includes(s));
+    params.push(`%${search}%`);
+    query += ` AND (u.name ILIKE $${params.length} OR a.title ILIKE $${params.length})`;
   }
-  if (status) items = items.filter(a => a.status === status);
-  items.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-  res.json(paginate(items, page, limit));
+  if (status) {
+    params.push(status);
+    query += ` AND ar.status = $${params.length}`;
+  }
+  
+  try {
+    const countRes = await pool.query(`SELECT COUNT(*) FROM (${query}) as t`, params);
+    query += ` ORDER BY ar.created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+    params.push(l, offset);
+    
+    const { rows } = await pool.query(query, params);
+    res.json({ data: rows, total: parseInt(countRes.rows[0].count), page: p, limit: l });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
-router.put('/advances/:id/status', (req, res) => {
-  const advance = db.advance_requests.find(a => a.id === Number(req.params.id));
-  if (!advance) return res.status(404).json({ error: 'Not found' });
-  const oldStatus = advance.status;
-  advance.status = req.body.status;
-  db.save();
-  logAudit(req.user.id, `Admin ${req.body.status.toLowerCase()} Advance Request #${req.params.id}`, oldStatus, req.body.status);
-  if (req.body.status === 'Approved') {
-    recalculateSettlement(advance.reporter_id, advance.assignment_id);
-    notify(advance.reporter_id, 'Advance Approved', `Your advance request of ₹${advance.amount} has been approved`);
-  } else if (req.body.status === 'Rejected') {
-    notify(advance.reporter_id, 'Advance Rejected', `Your advance request of ₹${advance.amount} was rejected`);
+router.put('/advances/:id/status', async (req, res) => {
+  try {
+    const advRes = await pool.query('SELECT status, reporter_id, assignment_id, amount FROM advance_requests WHERE id = $1', [req.params.id]);
+    if (advRes.rows.length === 0) return res.status(404).json({ error: 'Not found' });
+    
+    const advance = advRes.rows[0];
+    const oldStatus = advance.status;
+    const newStatus = req.body.status;
+    
+    await pool.query('UPDATE advance_requests SET status = $1 WHERE id = $2', [newStatus, req.params.id]);
+    await logAudit(req.user.id, `Admin ${newStatus.toLowerCase()} Advance Request #${req.params.id}`, oldStatus, newStatus);
+    
+    if (newStatus === 'Approved') {
+      await recalculateSettlement(advance.reporter_id, advance.assignment_id);
+      await notify(advance.reporter_id, 'Advance Approved', `Your advance request of ₹${advance.amount} has been approved`);
+    } else if (newStatus === 'Rejected') {
+      await notify(advance.reporter_id, 'Advance Rejected', `Your advance request of ₹${advance.amount} was rejected`);
+    }
+    res.json({ message: `Advance ${newStatus.toLowerCase()}` });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
   }
-  res.json({ message: `Advance ${req.body.status.toLowerCase()}` });
 });
 
-router.get('/expenses', (req, res) => {
+router.get('/expenses', async (req, res) => {
   const { search, status, category, page = 1, limit = 10 } = req.query;
-  let items = db.expenses.map(e => ({
-    ...e,
-    reporter_name: getUserName(e.reporter_id),
-    assignment_title: db.assignments.find(a => a.id === e.assignment_id)?.title || '—',
-  }));
+  const p = Number(page);
+  const l = Number(limit);
+  const offset = (p - 1) * l;
+  
+  let query = `
+    SELECT e.*, u.name as reporter_name, a.title as assignment_title
+    FROM expenses e
+    LEFT JOIN users u ON e.reporter_id = u.id
+    LEFT JOIN assignments a ON e.assignment_id = a.id
+    WHERE 1=1
+  `;
+  const params = [];
+  
   if (search) {
-    const s = search.toLowerCase();
-    items = items.filter(e => e.reporter_name.toLowerCase().includes(s) || e.assignment_title.toLowerCase().includes(s) || (e.description || '').toLowerCase().includes(s));
+    params.push(`%${search}%`);
+    query += ` AND (u.name ILIKE $${params.length} OR a.title ILIKE $${params.length} OR e.description ILIKE $${params.length})`;
   }
-  if (status) items = items.filter(e => e.status === status);
-  if (category) items = items.filter(e => e.category === category);
-  items.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-  res.json(paginate(items, page, limit));
+  if (status) {
+    params.push(status);
+    query += ` AND e.status = $${params.length}`;
+  }
+  if (category) {
+    params.push(category);
+    query += ` AND e.category = $${params.length}`;
+  }
+  
+  try {
+    const countRes = await pool.query(`SELECT COUNT(*) FROM (${query}) as t`, params);
+    query += ` ORDER BY e.created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+    params.push(l, offset);
+    
+    const { rows } = await pool.query(query, params);
+    res.json({ data: rows, total: parseInt(countRes.rows[0].count), page: p, limit: l });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
-router.put('/expenses/:id/status', (req, res) => {
-  const expense = db.expenses.find(e => e.id === Number(req.params.id));
-  if (!expense) return res.status(404).json({ error: 'Not found' });
-  const oldStatus = expense.status;
-  expense.status = req.body.status;
-  expense.remarks = req.body.remarks || null;
-  db.save();
-  logAudit(req.user.id, `Admin ${req.body.status.toLowerCase()} Expense #${req.params.id}`, oldStatus, req.body.status);
-  recalculateSettlement(expense.reporter_id, expense.assignment_id);
-  notify(expense.reporter_id, `Expense ${req.body.status}`, `Your expense of ₹${expense.amount} (${expense.category}) was ${req.body.status.toLowerCase()}`);
-  res.json({ message: `Expense ${req.body.status.toLowerCase()}` });
+router.put('/expenses/:id/status', async (req, res) => {
+  try {
+    const expRes = await pool.query('SELECT status, reporter_id, assignment_id, amount, category FROM expenses WHERE id = $1', [req.params.id]);
+    if (expRes.rows.length === 0) return res.status(404).json({ error: 'Not found' });
+    
+    const expense = expRes.rows[0];
+    const oldStatus = expense.status;
+    const newStatus = req.body.status;
+    
+    await pool.query('UPDATE expenses SET status = $1, remarks = $2 WHERE id = $3', [newStatus, req.body.remarks || null, req.params.id]);
+    
+    await logAudit(req.user.id, `Admin ${newStatus.toLowerCase()} Expense #${req.params.id}`, oldStatus, newStatus);
+    await recalculateSettlement(expense.reporter_id, expense.assignment_id);
+    await notify(expense.reporter_id, `Expense ${newStatus}`, `Your expense of ₹${expense.amount} (${expense.category}) was ${newStatus.toLowerCase()}`);
+    
+    res.json({ message: `Expense ${newStatus.toLowerCase()}` });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
-router.get('/settlements', (req, res) => {
+router.get('/settlements', async (req, res) => {
   const { search, status, page = 1, limit = 10 } = req.query;
-  let items = db.settlements.map(s => ({
-    ...s,
-    reporter_name: getUserName(s.reporter_id),
-    assignment_title: db.assignments.find(a => a.id === s.assignment_id)?.title || '—',
-  }));
+  const p = Number(page);
+  const l = Number(limit);
+  const offset = (p - 1) * l;
+  
+  let query = `
+    SELECT s.*, u.name as reporter_name, a.title as assignment_title
+    FROM settlements s
+    LEFT JOIN users u ON s.reporter_id = u.id
+    LEFT JOIN assignments a ON s.assignment_id = a.id
+    WHERE 1=1
+  `;
+  const params = [];
+  
   if (search) {
-    const s = search.toLowerCase();
-    items = items.filter(x => x.reporter_name.toLowerCase().includes(s) || x.assignment_title.toLowerCase().includes(s));
+    params.push(`%${search}%`);
+    query += ` AND (u.name ILIKE $${params.length} OR a.title ILIKE $${params.length})`;
   }
-  if (status) items = items.filter(s => s.settlement_status === status);
-  items.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-  res.json(paginate(items, page, limit));
+  if (status) {
+    params.push(status);
+    query += ` AND s.settlement_status = $${params.length}`;
+  }
+  
+  try {
+    const countRes = await pool.query(`SELECT COUNT(*) FROM (${query}) as t`, params);
+    query += ` ORDER BY s.created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+    params.push(l, offset);
+    
+    const { rows } = await pool.query(query, params);
+    res.json({ data: rows, total: parseInt(countRes.rows[0].count), page: p, limit: l });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
-router.put('/settlements/:id', (req, res) => {
-  const settlement = db.settlements.find(s => s.id === Number(req.params.id));
-  if (!settlement) return res.status(404).json({ error: 'Not found' });
-  const old = settlement.settlement_status;
-  settlement.settlement_status = req.body.settlement_status;
-  db.save();
-  logAudit(req.user.id, `Admin marked Settlement #${req.params.id} as ${req.body.settlement_status}`, old, req.body.settlement_status);
-  notify(settlement.reporter_id, 'Settlement Updated', `Settlement status updated to ${req.body.settlement_status}`);
-  res.json({ message: 'Settlement updated' });
+router.put('/settlements/:id', async (req, res) => {
+  try {
+    const settRes = await pool.query('SELECT settlement_status, reporter_id FROM settlements WHERE id = $1', [req.params.id]);
+    if (settRes.rows.length === 0) return res.status(404).json({ error: 'Not found' });
+    
+    const oldStatus = settRes.rows[0].settlement_status;
+    const newStatus = req.body.settlement_status;
+    
+    await pool.query('UPDATE settlements SET settlement_status = $1 WHERE id = $2', [newStatus, req.params.id]);
+    await logAudit(req.user.id, `Admin marked Settlement #${req.params.id} as ${newStatus}`, oldStatus, newStatus);
+    await notify(settRes.rows[0].reporter_id, 'Settlement Updated', `Settlement status updated to ${newStatus}`);
+    
+    res.json({ message: 'Settlement updated' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
-router.get('/analytics', (req, res) => {
-  const monthlyMap = {};
-  db.expenses.filter(e => e.status === 'Approved').forEach(e => {
-    const month = e.expense_date.slice(0, 7);
-    monthlyMap[month] = (monthlyMap[month] || 0) + e.amount;
-  });
-  const monthlyExpenses = Object.entries(monthlyMap).sort().slice(-6).map(([month, total]) => ({ month, total }));
+router.get('/analytics', async (req, res) => {
+  try {
+    const monthlyRes = await pool.query(`
+      SELECT TO_CHAR(expense_date, 'YYYY-MM') as month, SUM(amount) as total
+      FROM expenses WHERE status = 'Approved'
+      GROUP BY month ORDER BY month DESC LIMIT 6
+    `);
+    const monthlyExpenses = monthlyRes.rows.reverse();
 
-  const assignmentStats = ['Assigned', 'In Progress', 'Completed', 'Cancelled'].map(status => ({
-    status, count: db.assignments.filter(a => a.status === status).length,
-  })).filter(s => s.count > 0);
+    const assignmentStatsRes = await pool.query(`
+      SELECT status, COUNT(*) as count FROM assignments GROUP BY status
+    `);
+    const assignmentStats = assignmentStatsRes.rows;
 
-  const reporterExpenses = db.users.filter(u => u.role === 'reporter').map(u => ({
-    name: u.name,
-    total: db.expenses.filter(e => e.reporter_id === u.id && e.status === 'Approved').reduce((s, e) => s + e.amount, 0),
-  }));
+    const reporterExpRes = await pool.query(`
+      SELECT u.name, SUM(e.amount) as total
+      FROM expenses e JOIN users u ON e.reporter_id = u.id
+      WHERE e.status = 'Approved' GROUP BY u.name
+    `);
+    const reporterExpenses = reporterExpRes.rows;
 
-  const settlementStats = ['Pending', 'Verified', 'Settled'].map(status => ({
-    status, count: db.settlements.filter(s => s.settlement_status === status).length,
-  })).filter(s => s.count > 0);
+    const settlementStatsRes = await pool.query(`
+      SELECT settlement_status as status, COUNT(*) as count FROM settlements GROUP BY settlement_status
+    `);
+    const settlementStats = settlementStatsRes.rows;
 
-  const catMap = {};
-  db.expenses.filter(e => e.status === 'Approved').forEach(e => {
-    catMap[e.category] = (catMap[e.category] || 0) + e.amount;
-  });
-  const categoryBreakdown = Object.entries(catMap).map(([category, total]) => ({ category, total }));
+    const categoryRes = await pool.query(`
+      SELECT category, SUM(amount) as total FROM expenses WHERE status = 'Approved' GROUP BY category
+    `);
+    const categoryBreakdown = categoryRes.rows;
 
-  res.json({ monthlyExpenses, assignmentStats, reporterExpenses, settlementStats, categoryBreakdown });
+    res.json({ monthlyExpenses, assignmentStats, reporterExpenses, settlementStats, categoryBreakdown });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
-router.get('/audit-logs', (req, res) => {
+router.get('/audit-logs', async (req, res) => {
   const { search, page = 1, limit = 15 } = req.query;
-  let items = db.audit_logs.map(al => ({ ...al, user_name: getUserName(al.user_id) }));
+  const p = Number(page);
+  const l = Number(limit);
+  const offset = (p - 1) * l;
+  
+  let query = `
+    SELECT a.*, u.name as user_name 
+    FROM audit_logs a
+    LEFT JOIN users u ON a.user_id = u.id
+    WHERE 1=1
+  `;
+  const params = [];
+  
   if (search) {
-    const s = search.toLowerCase();
-    items = items.filter(al => al.action.toLowerCase().includes(s) || (al.user_name || '').toLowerCase().includes(s));
+    params.push(`%${search}%`);
+    query += ` AND (a.action ILIKE $${params.length} OR u.name ILIKE $${params.length})`;
   }
-  res.json(paginate(items, page, limit));
+  
+  try {
+    const countRes = await pool.query(`SELECT COUNT(*) FROM (${query}) as t`, params);
+    query += ` ORDER BY a.timestamp DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+    params.push(l, offset);
+    
+    const { rows } = await pool.query(query, params);
+    res.json({ data: rows, total: parseInt(countRes.rows[0].count), page: p, limit: l });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
-router.get('/export/expenses', (req, res) => {
-  res.json(db.expenses.map(e => ({
-    id: e.id, reporter: getUserName(e.reporter_id),
-    assignment: db.assignments.find(a => a.id === e.assignment_id)?.title,
-    category: e.category, amount: e.amount, expense_date: e.expense_date,
-    description: e.description, status: e.status,
-  })));
+router.get('/export/expenses', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT e.id, u.name as reporter, a.title as assignment, e.category, e.amount, e.expense_date, e.description, e.status
+      FROM expenses e
+      LEFT JOIN users u ON e.reporter_id = u.id
+      LEFT JOIN assignments a ON e.assignment_id = a.id
+    `);
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
-router.get('/export/settlements', (req, res) => {
-  res.json(db.settlements.map(s => ({
-    id: s.id, reporter: getUserName(s.reporter_id),
-    assignment: db.assignments.find(a => a.id === s.assignment_id)?.title,
-    advance_amount: s.advance_amount, expense_amount: s.expense_amount,
-    balance: s.balance, settlement_status: s.settlement_status,
-  })));
+router.get('/export/settlements', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT s.id, u.name as reporter, a.title as assignment, s.advance_amount, s.expense_amount, s.balance, s.settlement_status
+      FROM settlements s
+      LEFT JOIN users u ON s.reporter_id = u.id
+      LEFT JOIN assignments a ON s.assignment_id = a.id
+    `);
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
 module.exports = router;
