@@ -45,9 +45,10 @@ export default function AdminAssignments() {
     });
   };
 
-  const handleSave = async () => {
+  const handleSave = async (e) => {
+    if (e) e.preventDefault();
     setError('');
-    if (!form.reporter_id || !form.title || !form.start_date || !form.end_date) {
+    if (!form.reporter_id || !form.title || !form.location || !form.start_date || !form.end_date || !form.description || !form.priority) {
       setError('Please fill all required fields.');
       return;
     }
@@ -68,6 +69,7 @@ export default function AdminAssignments() {
       setModal(false);
       load(data.page);
     } catch (err) {
+      console.error('Save Assignment Error:', err);
       setError(err.message || 'Error saving assignment');
     }
   };
@@ -123,66 +125,68 @@ export default function AdminAssignments() {
       </div>
 
       <Modal open={modal} onClose={() => setModal(false)} title={editId ? 'Edit Assignment' : 'Create Assignment'}
-        footer={<><button className="btn btn-secondary" onClick={() => setModal(false)}>Cancel</button><button className="btn btn-primary" onClick={handleSave}>Save</button></>}>
-        {error && <div className="alert alert-danger" style={{ marginBottom: '1rem', color: '#dc3545', background: '#f8d7da', padding: '10px', borderRadius: '4px' }}>{error}</div>}
-        <div className="form-row">
-          <div className="form-group">
-            <label>Reporter</label>
-            <select className="form-select" value={form.reporter_id} onChange={e => setForm({ ...form, reporter_id: Number(e.target.value) })}>
-              <option value="">Select Reporter</option>
-              {reporters.map(r => <option key={r.id} value={r.id}>{r.name}</option>)}
-            </select>
+        footer={<><button type="button" className="btn btn-secondary" onClick={() => setModal(false)}>Cancel</button><button type="submit" form="assignment-form" className="btn btn-primary">Save</button></>}>
+        <form id="assignment-form" onSubmit={handleSave}>
+          {error && <div className="alert alert-danger" style={{ marginBottom: '1rem', color: '#dc3545', background: '#f8d7da', padding: '10px', borderRadius: '4px' }}>{error}</div>}
+          <div className="form-row">
+            <div className="form-group">
+              <label>Reporter</label>
+              <select className="form-select" value={form.reporter_id} onChange={e => setForm({ ...form, reporter_id: Number(e.target.value) })}>
+                <option value="">Select Reporter</option>
+                {reporters.map(r => <option key={r.id} value={r.id}>{r.name}</option>)}
+              </select>
+            </div>
+            <div className="form-group">
+              <label>Priority</label>
+              <select className="form-select" value={form.priority} onChange={e => setForm({ ...form, priority: e.target.value })}>
+                {['High', 'Medium', 'Low'].map(p => <option key={p} value={p}>{p}</option>)}
+              </select>
+            </div>
           </div>
           <div className="form-group">
-            <label>Priority</label>
-            <select className="form-select" value={form.priority} onChange={e => setForm({ ...form, priority: e.target.value })}>
-              {['High', 'Medium', 'Low'].map(p => <option key={p} value={p}>{p}</option>)}
-            </select>
-          </div>
-        </div>
-        <div className="form-group">
-          <label>Title</label>
-          <input className="form-input" value={form.title} onChange={e => setForm({ ...form, title: e.target.value })} />
-        </div>
-        <div className="form-group">
-          <label>Location</label>
-          <input className="form-input" value={form.location} onChange={e => setForm({ ...form, location: e.target.value })} />
-        </div>
-        <div className="form-row">
-          <div className="form-group">
-            <label>Start Date</label>
-            <input 
-              className="form-input" 
-              type="date" 
-              min={todayStr} 
-              value={form.start_date ? form.start_date.split('T')[0] : ''} 
-              onChange={handleStartDateChange} 
-            />
+            <label>Title</label>
+            <input className="form-input" value={form.title} onChange={e => setForm({ ...form, title: e.target.value })} />
           </div>
           <div className="form-group">
-            <label>End Date</label>
-            <input 
-              className="form-input" 
-              type="date" 
-              min={form.start_date ? form.start_date.split('T')[0] : todayStr} 
-              disabled={!form.start_date}
-              value={form.end_date ? form.end_date.split('T')[0] : ''} 
-              onChange={e => setForm({ ...form, end_date: e.target.value })} 
-            />
+            <label>Location</label>
+            <input className="form-input" value={form.location} onChange={e => setForm({ ...form, location: e.target.value })} />
           </div>
-        </div>
-        {editId && (
+          <div className="form-row">
+            <div className="form-group">
+              <label>Start Date</label>
+              <input 
+                className="form-input" 
+                type="date" 
+                min={todayStr} 
+                value={form.start_date ? form.start_date.split('T')[0] : ''} 
+                onChange={handleStartDateChange} 
+              />
+            </div>
+            <div className="form-group">
+              <label>End Date</label>
+              <input 
+                className="form-input" 
+                type="date" 
+                min={form.start_date ? form.start_date.split('T')[0] : todayStr} 
+                disabled={!form.start_date}
+                value={form.end_date ? form.end_date.split('T')[0] : ''} 
+                onChange={e => setForm({ ...form, end_date: e.target.value })} 
+              />
+            </div>
+          </div>
+          {editId && (
+            <div className="form-group">
+              <label>Status</label>
+              <select className="form-select" value={form.status} onChange={e => setForm({ ...form, status: e.target.value })}>
+                {['Assigned', 'In Progress', 'Completed', 'Cancelled'].map(s => <option key={s} value={s}>{s}</option>)}
+              </select>
+            </div>
+          )}
           <div className="form-group">
-            <label>Status</label>
-            <select className="form-select" value={form.status} onChange={e => setForm({ ...form, status: e.target.value })}>
-              {['Assigned', 'In Progress', 'Completed', 'Cancelled'].map(s => <option key={s} value={s}>{s}</option>)}
-            </select>
+            <label>Description</label>
+            <textarea className="form-textarea" value={form.description} onChange={e => setForm({ ...form, description: e.target.value })} />
           </div>
-        )}
-        <div className="form-group">
-          <label>Description</label>
-          <textarea className="form-textarea" value={form.description} onChange={e => setForm({ ...form, description: e.target.value })} />
-        </div>
+        </form>
       </Modal>
     </div>
   );

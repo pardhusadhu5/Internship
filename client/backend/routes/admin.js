@@ -88,8 +88,8 @@ router.post('/assignments', async (req, res) => {
     await notify(reporter_id, 'New Assignment', `You have been assigned: ${title}`);
     res.json({ id, message: 'Assignment created' });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Server error' });
+    console.error('Database Error in Create Assignment:', err);
+    res.status(500).json({ error: err.message || 'Server error' });
   }
 });
 
