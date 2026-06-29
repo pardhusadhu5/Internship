@@ -84,6 +84,13 @@ router.post('/assignments', async (req, res) => {
     );
     const id = rows[0].id;
     
+    // Automatically create a blank settlement record for the new assignment
+    await pool.query(
+      `INSERT INTO settlements (reporter_id, assignment_id, advance_amount, expense_amount, balance, settlement_status) 
+       VALUES ($1, $2, 0, 0, 0, 'Pending')`,
+      [reporter_id, id]
+    );
+
     await logAudit(req.user.id, `Admin created Assignment #${id}`, null, title);
     await notify(reporter_id, 'New Assignment', `You have been assigned: ${title}`);
     res.json({ id, message: 'Assignment created' });
