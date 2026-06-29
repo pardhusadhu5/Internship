@@ -15,6 +15,22 @@ export default function AdminAnalytics() {
   }, []);
 
   if (!data) return <div>Loading analytics...</div>;
+  
+  const hasData = 
+    (data.monthlyExpenses && data.monthlyExpenses.length > 0) || 
+    (data.assignmentStats && data.assignmentStats.length > 0) || 
+    (data.reporterExpenses && data.reporterExpenses.length > 0) || 
+    (data.categoryBreakdown && data.categoryBreakdown.length > 0) || 
+    (data.settlementStats && data.settlementStats.length > 0);
+
+  if (!hasData) {
+    return (
+      <div className="card" style={{ padding: '3rem', textAlign: 'center', color: 'var(--text-muted)' }}>
+        <h3 style={{ marginBottom: '0.5rem' }}>No Data Available</h3>
+        <p>Analytics will populate here once assignments and expenses are processed.</p>
+      </div>
+    );
+  }
 
   return (
     <div>
