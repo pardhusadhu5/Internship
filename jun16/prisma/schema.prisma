@@ -1,0 +1,86 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("POSTGRES_URL")
+}
+
+model Table {
+  id              String   @id @default(uuid())
+  number          String   @unique
+  floor           String
+  capacity        Int
+  status          String   @default("AVAILABLE")
+  bookingTimeSlot String?
+  customerName    String?
+  customerPhone   String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}
+
+model MenuItem {
+  id          Int      @id @default(autoincrement())
+  name        String
+  price       Float
+  category    String
+  type        String
+  image       String
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model Order {
+  id            String      @id
+  tableNo       String
+  customerName  String
+  customerPhone String
+  status        String
+  timestamp     Float
+  isParcel      Boolean
+  specialNotes  String?
+  pickupTime    String?
+  paymentMethod String?
+  items         OrderItem[]
+  invoice       Invoice?
+}
+
+model OrderItem {
+  id           String  @id @default(uuid())
+  orderId      String
+  order        Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  menuItemId   Int
+  name         String
+  price        Float
+  quantity     Int
+  isAdditional Boolean @default(false)
+  addedAt      Float?
+}
+
+model Invoice {
+  invoiceNo     String   @id
+  orderId       String   @unique
+  order         Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  tableNo       String
+  customerName  String
+  subtotal      Float
+  tax           Float
+  serviceCharge Float
+  total         Float
+  timestamp     Float
+  isParcel      Boolean
+  paymentMethod String
+}
+
+model Rating {
+  id            String  @id
+  customerName  String
+  customerPhone String
+  food          Int
+  service       Int
+  ambience      Int
+  comment       String?
+  timestamp     Float
+}
